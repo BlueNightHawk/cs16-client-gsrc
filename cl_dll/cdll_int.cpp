@@ -57,7 +57,7 @@ int DLLEXPORT Initialize( cl_enginefunc_t *pEnginefuncs, int iVersion )
 
 	gEngfuncs = *pEnginefuncs;
 
-	sscanf( CVAR_GET_STRING( "host_ver" ), "%d", &g_iXash );
+//	sscanf( CVAR_GET_STRING( "host_ver" ), "%d", &g_iXash );
 
 	Game_HookEvents();
 
@@ -148,6 +148,8 @@ void DLLEXPORT HUD_PlayerMove( struct playermove_s *ppmove, int server )
 {
 	PM_Move( ppmove, server );
 }
+
+#define _CS16CLIENT_ENABLE_GSRC_SUPPORT
 
 #ifdef _CS16CLIENT_ENABLE_GSRC_SUPPORT
 /*

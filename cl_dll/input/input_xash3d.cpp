@@ -1,283 +1,554 @@
+//========= Copyright © 1996-2002, Valve LLC, All rights reserved. ============
+//
+// Purpose: 
+//
+// $NoKeywords: $
+//=============================================================================
+
+// in_win.c -- windows 95 mouse and joystick code
+// 02/21/97 JCB Added extended DirectInput code to support external controllers.
+
 #include "hud.h"
-#include "usercmd.h"
-#include "cvardef.h"
+#include "cl_util.h"
+#include "camera.h"
 #include "kbutton.h"
-#include "keydefs.h"
-#include "input.h"
+#include "cvardef.h"
+#include "usercmd.h"
+#include "const.h"
+#include "camera.h"
+#include "in_defs.h"
+#include "../engine/keydefs.h"
+#include "view.h"
+#include "port.h"
 
-#define	PITCH	0
-#define	YAW		1
-#define	ROLL	2 
+#define MOUSE_BUTTON_COUNT 5
 
-cvar_t	*cl_laddermode;
-cvar_t	*sensitivity;
-cvar_t	*in_joystick;
-cvar_t	*evdev_grab;
+// Set this to 1 to show mouse cursor.  Experimental
+int	g_iVisibleMouse = 0;
 
-
-float ac_forwardmove;
-float ac_sidemove;
-int ac_movecount;
-float rel_yaw;
-float rel_pitch;
-bool bMouseInUse = false;
-
-extern Vector dead_viewangles;
-extern bool evdev_open;
-
-#define F 1U<<0	// Forward
-#define B 1U<<1	// Back
-#define L 1U<<2	// Left
-#define R 1U<<3	// Right
-#define T 1U<<4	// Forward stop
-#define S 1U<<5	// Side stop
-
-#define BUTTON_DOWN		1
-#define IMPULSE_DOWN	2
-#define IMPULSE_UP		4
-
-bool CL_IsDead();
-
-void IN_ToggleButtons( float forwardmove, float sidemove )
+extern "C"
 {
-	static unsigned int moveflags = T | S;
+	void DLLEXPORT IN_ActivateMouse(void);
+	void DLLEXPORT IN_DeactivateMouse(void);
+	void DLLEXPORT IN_MouseEvent(int mstate);
+	void DLLEXPORT IN_Accumulate(void);
+	void DLLEXPORT IN_ClearStates(void);
+}
 
-	if( forwardmove )
-		moveflags &= ~T;
-	else
+extern cl_enginefunc_t gEngfuncs;
+
+extern int iMouseInUse;
+
+extern kbutton_t	in_strafe;
+extern kbutton_t	in_mlook;
+extern kbutton_t	in_speed;
+extern kbutton_t	in_jlook;
+
+extern cvar_t* m_pitch;
+extern cvar_t* m_yaw;
+extern cvar_t* m_forward;
+extern cvar_t* m_side;
+
+extern cvar_t* lookstrafe;
+extern cvar_t* lookspring;
+extern cvar_t* cl_pitchdown;
+extern cvar_t* cl_pitchup;
+extern cvar_t* cl_yawspeed;
+extern cvar_t* cl_sidespeed;
+extern cvar_t* cl_forwardspeed;
+extern cvar_t* cl_pitchspeed;
+extern cvar_t* cl_movespeedkey;
+
+// mouse variables
+cvar_t* m_filter;
+cvar_t* sensitivity;
+
+int			mouse_buttons;
+int			mouse_oldbuttonstate;
+POINT		current_pos;
+int			mouse_x, mouse_y, old_mouse_x, old_mouse_y, mx_accum, my_accum;
+
+static int	restore_spi;
+static int	originalmouseparms[3], newmouseparms[3] = { 0, 0, 1 };
+static int	mouseactive;
+int			mouseinitialized;
+static int	mouseparmsvalid;
+static int	mouseshowtoggle = 1;
+
+// joystick defines and variables
+// where should defines be moved?
+#define JOY_ABSOLUTE_AXIS	0x00000000		// control like a joystick
+#define JOY_RELATIVE_AXIS	0x00000010		// control like a mouse, spinner, trackball
+#define	JOY_MAX_AXES		6				// X, Y, Z, R, U, V
+#define JOY_AXIS_X			0
+#define JOY_AXIS_Y			1
+#define JOY_AXIS_Z			2
+#define JOY_AXIS_R			3
+#define JOY_AXIS_U			4
+#define JOY_AXIS_V			5
+
+enum _ControlList
+{
+	AxisNada = 0,
+	AxisForward,
+	AxisLook,
+	AxisSide,
+	AxisTurn
+};
+
+DWORD dwAxisFlags[JOY_MAX_AXES] =
+{
+	JOY_RETURNX,
+	JOY_RETURNY,
+	JOY_RETURNZ,
+	JOY_RETURNR,
+	JOY_RETURNU,
+	JOY_RETURNV
+};
+
+DWORD	dwAxisMap[JOY_MAX_AXES];
+DWORD	dwControlMap[JOY_MAX_AXES];
+PDWORD	pdwRawValue[JOY_MAX_AXES];
+
+// none of these cvars are saved over a session
+// this means that advanced controller configuration needs to be executed
+// each time.  this avoids any problems with getting back to a default usage
+// or when changing from one controller to another.  this way at least something
+// works.
+cvar_t* in_joystick;
+cvar_t* joy_name;
+cvar_t* joy_advanced;
+cvar_t* joy_advaxisx;
+cvar_t* joy_advaxisy;
+cvar_t* joy_advaxisz;
+cvar_t* joy_advaxisr;
+cvar_t* joy_advaxisu;
+cvar_t* joy_advaxisv;
+cvar_t* joy_forwardthreshold;
+cvar_t* joy_sidethreshold;
+cvar_t* joy_pitchthreshold;
+cvar_t* joy_yawthreshold;
+cvar_t* joy_forwardsensitivity;
+cvar_t* joy_sidesensitivity;
+cvar_t* joy_pitchsensitivity;
+cvar_t* joy_yawsensitivity;
+cvar_t* joy_wwhack1;
+cvar_t* joy_wwhack2;
+
+int			joy_avail, joy_advancedinit, joy_haspov;
+DWORD		joy_oldbuttonstate, joy_oldpovstate;
+
+int			joy_id;
+DWORD		joy_flags;
+DWORD		joy_numbuttons;
+
+static JOYINFOEX	ji;
+
+/*
+===========
+Force_CenterView_f
+===========
+*/
+void Force_CenterView_f(void)
+{
+	vec3_t viewangles;
+
+	if (!iMouseInUse)
 	{
-		//if( in_forward.state || in_back.state ) gEngfuncs.Con_Printf("Buttons pressed f%d b%d\n", in_forward.state, in_back.state);
-		if( !( moveflags & T ) )
+		gEngfuncs.GetViewAngles((float*)viewangles);
+		viewangles[PITCH] = 0;
+		gEngfuncs.SetViewAngles((float*)viewangles);
+	}
+}
+
+/*
+===========
+IN_ActivateMouse
+===========
+*/
+void DLLEXPORT IN_ActivateMouse(void)
+{
+	if (mouseinitialized)
+	{
+		if (mouseparmsvalid)
+			restore_spi = SystemParametersInfo(SPI_SETMOUSE, 0, newmouseparms, 0);
+		mouseactive = 1;
+	}
+}
+
+/*
+===========
+IN_DeactivateMouse
+===========
+*/
+void DLLEXPORT IN_DeactivateMouse(void)
+{
+	if (mouseinitialized)
+	{
+		if (restore_spi)
+			SystemParametersInfo(SPI_SETMOUSE, 0, originalmouseparms, 0);
+
+		mouseactive = 0;
+	}
+}
+
+/*
+===========
+IN_StartupMouse
+===========
+*/
+void IN_StartupMouse(void)
+{
+	if (gEngfuncs.CheckParm("-nomouse", NULL))
+		return;
+
+	mouseinitialized = 1;
+	mouseparmsvalid = SystemParametersInfo(SPI_GETMOUSE, 0, originalmouseparms, 0);
+
+	if (mouseparmsvalid)
+	{
+		if (gEngfuncs.CheckParm("-noforcemspd", NULL))
+			newmouseparms[2] = originalmouseparms[2];
+
+		if (gEngfuncs.CheckParm("-noforcemaccel", NULL))
 		{
-			//IN_ForwardUp();
-			//IN_BackUp();
-			//gEngfuncs.Con_Printf("Reset forwardmove state f%d b%d\n", in_forward.state, in_back.state);
-			in_forward.state &= ~BUTTON_DOWN;
-			in_back.state &= ~BUTTON_DOWN;
-			moveflags |= T;
+			newmouseparms[0] = originalmouseparms[0];
+			newmouseparms[1] = originalmouseparms[1];
+		}
+
+		if (gEngfuncs.CheckParm("-noforcemparms", NULL))
+		{
+			newmouseparms[0] = originalmouseparms[0];
+			newmouseparms[1] = originalmouseparms[1];
+			newmouseparms[2] = originalmouseparms[2];
 		}
 	}
-	if( sidemove )
-		moveflags &= ~S;
-	else
+
+	mouse_buttons = MOUSE_BUTTON_COUNT;
+}
+
+/*
+===========
+IN_Shutdown
+===========
+*/
+void IN_Shutdown(void)
+{
+	IN_DeactivateMouse();
+}
+
+/*
+===========
+IN_GetMousePos
+
+Ask for mouse position from engine
+===========
+*/
+void IN_GetMousePos(int* mx, int* my)
+{
+	gEngfuncs.GetMousePosition(mx, my);
+}
+
+/*
+===========
+IN_ResetMouse
+
+FIXME: Call through to engine?
+===========
+*/
+void IN_ResetMouse(void)
+{
+	SetCursorPos(gEngfuncs.GetWindowCenterX(), gEngfuncs.GetWindowCenterY());
+}
+
+/*
+===========
+IN_MouseEvent
+===========
+*/
+void DLLEXPORT IN_MouseEvent(int mstate)
+{
+	int		i;
+
+	if (iMouseInUse || g_iVisibleMouse)
+		return;
+
+	// perform button actions
+	for (i = 0; i < mouse_buttons; i++)
 	{
-		//gEngfuncs.Con_Printf("l%d r%d\n", in_moveleft.state, in_moveright.state);
-		//if( in_moveleft.state || in_moveright.state ) gEngfuncs.Con_Printf("Buttons pressed l%d r%d\n", in_moveleft.state, in_moveright.state);
-		if( !( moveflags & S ) )
+		if ((mstate & (1 << i)) &&
+			!(mouse_oldbuttonstate & (1 << i)))
 		{
-			//IN_MoverightUp();
-			//IN_MoveleftUp();
-			//gEngfuncs.Con_Printf("Reset sidemove state f%d b%d\n", in_moveleft.state, in_moveright.state);
-			in_moveleft.state &= ~BUTTON_DOWN;
-			in_moveright.state &= ~BUTTON_DOWN;
-			moveflags |= S;
+			gEngfuncs.Key_Event(K_MOUSE1 + i, 1);
+		}
+
+		if (!(mstate & (1 << i)) &&
+			(mouse_oldbuttonstate & (1 << i)))
+		{
+			gEngfuncs.Key_Event(K_MOUSE1 + i, 0);
 		}
 	}
 
-	if ( forwardmove > 0.7 && !( moveflags & F ))
-	{
-		moveflags |= F;
-		in_forward.state |= BUTTON_DOWN;
-	}
-	if ( forwardmove < 0.7 && ( moveflags & F ))
-	{
-		moveflags &= ~F;
-		in_forward.state &= ~BUTTON_DOWN;
-	}
-	if ( forwardmove < -0.7 && !( moveflags & B ))
-	{
-		moveflags |= B;
-		in_back.state |= BUTTON_DOWN;
-	}
-	if ( forwardmove > -0.7 && ( moveflags & B ))
-	{
-		moveflags &= ~B;
-		in_back.state &= ~BUTTON_DOWN;
-	}
-	if ( sidemove > 0.9 && !( moveflags & R ))
-	{
-		moveflags |= R;
-		in_moveright.state |= BUTTON_DOWN;
-	}
-	if ( sidemove < 0.9 && ( moveflags & R ))
-	{
-		moveflags &= ~R;
-		in_moveright.state &= ~BUTTON_DOWN;
-	}
-	if ( sidemove < -0.9 && !( moveflags & L ))
-	{
-		moveflags |= L;
-		in_moveleft.state |= BUTTON_DOWN;
-	}
-	if ( sidemove > -0.9 && ( moveflags & L ))
-	{
-		moveflags &= ~L;
-		in_moveleft.state &= ~BUTTON_DOWN;
-	}
-
+	mouse_oldbuttonstate = mstate;
 }
 
-void IN_ClientMoveEvent( float forwardmove, float sidemove )
+/*
+===========
+IN_MouseMove
+===========
+*/
+void IN_MouseMove(float frametime, usercmd_t* cmd)
 {
-	//gEngfuncs.Con_Printf("IN_MoveEvent\n");
+	int		mx, my;
+	vec3_t viewangles;
 
-	ac_forwardmove += forwardmove;
-	ac_sidemove += sidemove;
-	ac_movecount++;
-}
+	gEngfuncs.GetViewAngles((float*)viewangles);
 
-void IN_ClientLookEvent( float relyaw, float relpitch )
-{
-	rel_yaw += relyaw;
-	rel_pitch += relpitch;
-}
-
-// Rotate camera and add move values to usercmd
-void IN_Move( float frametime, usercmd_t *cmd )
-{
-	Vector viewangles;
-	bool bLadder = false;
-
-	if( gHUD.m_iIntermission )
-		return; // we can't move during intermission
-
-
-	if( cl_laddermode->value != 2 )
-	{
-		cl_entity_t *pplayer = gEngfuncs.GetLocalPlayer();
-		if( pplayer )
-			bLadder = pplayer->curstate.movetype == MOVETYPE_FLY;
-	}
-	//if(ac_forwardmove || ac_sidemove)
-	//gEngfuncs.Con_Printf("Move: %f %f %f %f\n", ac_forwardmove, ac_sidemove, rel_pitch, rel_yaw);
 #if 0
-	if( in_mlook.state & 1 )
+	if (in_mlook.state & 1)
 	{
 		V_StopPitchDrift();
 	}
 #endif
 
-	if( CL_IsDead( ) )
+	//jjb - this disbles normal mouse control if the user is trying to 
+	//      move the camera, or if the mouse cursor is visible or if we're in intermission
+	if (!iMouseInUse && !g_iVisibleMouse && !gHUD.m_iIntermission)
 	{
-		viewangles = dead_viewangles; // HACKHACK: see below
-	}
-	else
-	{
-		gEngfuncs.GetViewAngles( viewangles );
-	}
+		GetCursorPos(&current_pos);
 
-	if( gHUD.GetSensitivity() != 0 )
-	{
-		rel_yaw *= gHUD.GetSensitivity();
-		rel_pitch *= gHUD.GetSensitivity();
-	}
-	else
-	{
-		rel_yaw *= sensitivity->value;
-		rel_pitch *= sensitivity->value;
-	}
-	if(gHUD.m_MOTD.cl_hide_motd->value == 0.0f && gHUD.m_MOTD.m_bShow)
-	{
-		gHUD.m_MOTD.scroll += rel_pitch;
-	}
-	else
-	{
-		viewangles[PITCH] += rel_pitch;
-		viewangles[YAW] += rel_yaw;
-		if( bLadder )
+		mx = current_pos.x - gEngfuncs.GetWindowCenterX() + mx_accum;
+		my = current_pos.y - gEngfuncs.GetWindowCenterY() + my_accum;
+
+		mx_accum = 0;
+		my_accum = 0;
+
+		if (m_filter->value)
 		{
-			if( ( cl_laddermode->value == 1 ) )
-				viewangles[YAW] -= ac_sidemove * 5;
-			ac_sidemove = 0;
+			mouse_x = (mx + old_mouse_x) * 0.5;
+			mouse_y = (my + old_mouse_y) * 0.5;
 		}
-	}
-	if (viewangles[PITCH] > cl_pitchdown->value)
-		viewangles[PITCH] = cl_pitchdown->value;
-	if (viewangles[PITCH] < -cl_pitchup->value)
-		viewangles[PITCH] = -cl_pitchup->value;
-
-
-	if( !CL_IsDead( ) )
-	{
-		gEngfuncs.SetViewAngles( viewangles );
-	}
-
-	dead_viewangles = viewangles;
-	
-	if( ac_movecount )
-	{
-		IN_ToggleButtons( ac_forwardmove / ac_movecount, ac_sidemove / ac_movecount );
-		if( ac_forwardmove ) cmd->forwardmove  = ac_forwardmove * cl_forwardspeed->value / ac_movecount;
-		if( ac_sidemove ) cmd->sidemove  = ac_sidemove * cl_sidespeed->value / ac_movecount;
-		if (in_speed.state & 1)
+		else
 		{
-			cmd->forwardmove *= cl_movespeedkey->value;
-			cmd->sidemove *= cl_movespeedkey->value;
-		}
-	}
-	
-	ac_sidemove = ac_forwardmove = rel_pitch = rel_yaw = 0;
-	ac_movecount = 0;
-}
-
-void DLLEXPORT IN_MouseEvent( int mstate )
-{
-	static int mouse_oldbuttonstate;
-	// perform button actions
-	for( int i = 0; i < 5; i++ )
-	{
-		if(( mstate & (1 << i)) && !( mouse_oldbuttonstate & (1 << i)))
-		{
-			gEngfuncs.Key_Event( K_MOUSE1 + i, 1 );
+			mouse_x = mx;
+			mouse_y = my;
 		}
 
-		if( !( mstate & (1 << i)) && ( mouse_oldbuttonstate & (1 << i)))
+		old_mouse_x = mx;
+		old_mouse_y = my;
+
+		if (gHUD.GetSensitivity() != 0)
 		{
-			gEngfuncs.Key_Event( K_MOUSE1 + i, 0 );
+			mouse_x *= gHUD.GetSensitivity();
+			mouse_y *= gHUD.GetSensitivity();
 		}
-	}	
-	
-	mouse_oldbuttonstate = mstate;
-	bMouseInUse = true;
+		else
+		{
+			mouse_x *= sensitivity->value;
+			mouse_y *= sensitivity->value;
+		}
+
+		// add mouse X/Y movement to cmd
+		if ((in_strafe.state & 1) || (lookstrafe->value && (in_mlook.state & 1)))
+			cmd->sidemove += m_side->value * mouse_x;
+		else
+			viewangles[YAW] -= m_yaw->value * mouse_x;
+
+		if ((in_mlook.state & 1) && !(in_strafe.state & 1))
+		{
+			viewangles[PITCH] += m_pitch->value * mouse_y;
+			if (viewangles[PITCH] > cl_pitchdown->value)
+				viewangles[PITCH] = cl_pitchdown->value;
+			if (viewangles[PITCH] < -cl_pitchup->value)
+				viewangles[PITCH] = -cl_pitchup->value;
+		}
+		else
+		{
+			if ((in_strafe.state & 1) && gEngfuncs.IsNoClipping())
+			{
+				cmd->upmove -= m_forward->value * mouse_y;
+			}
+			else
+			{
+				cmd->forwardmove -= m_forward->value * mouse_y;
+			}
+		}
+
+		// if the mouse has moved, force it to the center, so there's room to move
+		if (mx || my)
+		{
+			IN_ResetMouse();
+		}
+	}
+
+	gEngfuncs.SetViewAngles((float*)viewangles);
+
+	/*
+	//#define TRACE_TEST
+	#if defined( TRACE_TEST )
+		{
+			int mx, my;
+			void V_Move( int mx, int my );
+			IN_GetMousePos( &mx, &my );
+			V_Move( mx, my );
+		}
+	#endif
+	*/
 }
 
-// Stubs
-
-void DLLEXPORT IN_ClearStates ( void )
+/*
+===========
+IN_Accumulate
+===========
+*/
+void DLLEXPORT IN_Accumulate(void)
 {
-	//gEngfuncs.Con_Printf("IN_ClearStates\n");
+	//only accumulate mouse if we are not moving the camera with the mouse
+	if (!iMouseInUse && !g_iVisibleMouse)
+	{
+		if (mouseactive)
+		{
+			GetCursorPos(&current_pos);
+
+			mx_accum += current_pos.x - gEngfuncs.GetWindowCenterX();
+			my_accum += current_pos.y - gEngfuncs.GetWindowCenterY();
+
+			// force the mouse to the center, so there's room to move
+			IN_ResetMouse();
+		}
+	}
+
 }
 
-void  DLLEXPORT IN_ActivateMouse ( void )
+/*
+===================
+IN_ClearStates
+===================
+*/
+void DLLEXPORT IN_ClearStates(void)
 {
-	//gEngfuncs.Con_Printf("IN_ActivateMouse\n");
+	if (!mouseactive)
+		return;
+
+	mx_accum = 0;
+	my_accum = 0;
+	mouse_oldbuttonstate = 0;
 }
 
-void DLLEXPORT  IN_DeactivateMouse ( void )
+/*
+===========
+IN_Commands
+===========
+*/
+void IN_Commands(void)
 {
-	//gEngfuncs.Con_Printf("IN_DeactivateMouse\n");
+	int		i, key_index;
+	DWORD	buttonstate, povstate;
+
+	if (!joy_avail)
+	{
+		return;
+	}
+
+
+	// loop through the joystick buttons
+	// key a joystick event or auxiliary event for higher number buttons for each state change
+	buttonstate = ji.dwButtons;
+	for (i = 0; i < (int)joy_numbuttons; i++)
+	{
+		if ((buttonstate & (1 << i)) && !(joy_oldbuttonstate & (1 << i)))
+		{
+			key_index = (i < 4) ? K_JOY1 : K_AUX1;
+			gEngfuncs.Key_Event(key_index + i, 1);
+		}
+
+		if (!(buttonstate & (1 << i)) && (joy_oldbuttonstate & (1 << i)))
+		{
+			key_index = (i < 4) ? K_JOY1 : K_AUX1;
+			gEngfuncs.Key_Event(key_index + i, 0);
+		}
+	}
+	joy_oldbuttonstate = buttonstate;
+
+	if (joy_haspov)
+	{
+		// convert POV information into 4 bits of state information
+		// this avoids any potential problems related to moving from one
+		// direction to another without going through the center position
+		povstate = 0;
+		if (ji.dwPOV != JOY_POVCENTERED)
+		{
+			if (ji.dwPOV == JOY_POVFORWARD)
+				povstate |= 0x01;
+			if (ji.dwPOV == JOY_POVRIGHT)
+				povstate |= 0x02;
+			if (ji.dwPOV == JOY_POVBACKWARD)
+				povstate |= 0x04;
+			if (ji.dwPOV == JOY_POVLEFT)
+				povstate |= 0x08;
+		}
+		// determine which bits have changed and key an auxiliary event for each change
+		for (i = 0; i < 4; i++)
+		{
+			if ((povstate & (1 << i)) && !(joy_oldpovstate & (1 << i)))
+			{
+				gEngfuncs.Key_Event(K_AUX29 + i, 1);
+			}
+
+			if (!(povstate & (1 << i)) && (joy_oldpovstate & (1 << i)))
+			{
+				gEngfuncs.Key_Event(K_AUX29 + i, 0);
+			}
+		}
+		joy_oldpovstate = povstate;
+	}
 }
 
-void DLLEXPORT IN_Accumulate ( void )
+
+/*
+===========
+IN_Move
+===========
+*/
+void IN_Move(float frametime, usercmd_t* cmd)
 {
-	//gEngfuncs.Con_Printf("IN_Accumulate\n");
+	if (!iMouseInUse && mouseactive)
+	{
+		IN_MouseMove(frametime, cmd);
+	}
 }
 
-void IN_Commands ( void )
+/*
+===========
+IN_Init
+===========
+*/
+void IN_Init(void)
 {
-	//gEngfuncs.Con_Printf("IN_Commands\n");
-}
+	m_filter = gEngfuncs.pfnRegisterVariable("m_filter", "0", FCVAR_ARCHIVE);
+	sensitivity = gEngfuncs.pfnRegisterVariable("sensitivity", "3", FCVAR_ARCHIVE); // user mouse sensitivity setting.
 
-void IN_Shutdown ( void )
-{
-}
-// Register cvars and reset data
-void IN_Init( void )
-{
-	sensitivity = gEngfuncs.pfnRegisterVariable ( "sensitivity", "3", FCVAR_ARCHIVE );
-	in_joystick = gEngfuncs.pfnRegisterVariable ( "joystick", "0", FCVAR_ARCHIVE );
-	cl_laddermode = gEngfuncs.pfnRegisterVariable ( "cl_laddermode", "2", FCVAR_ARCHIVE );
-	evdev_grab = gEngfuncs.pfnGetCvarPointer("evdev_grab");
+	in_joystick = gEngfuncs.pfnRegisterVariable("joystick", "0", FCVAR_ARCHIVE);
+	joy_name = gEngfuncs.pfnRegisterVariable("joyname", "joystick", 0);
+	joy_advanced = gEngfuncs.pfnRegisterVariable("joyadvanced", "0", 0);
+	joy_advaxisx = gEngfuncs.pfnRegisterVariable("joyadvaxisx", "0", 0);
+	joy_advaxisy = gEngfuncs.pfnRegisterVariable("joyadvaxisy", "0", 0);
+	joy_advaxisz = gEngfuncs.pfnRegisterVariable("joyadvaxisz", "0", 0);
+	joy_advaxisr = gEngfuncs.pfnRegisterVariable("joyadvaxisr", "0", 0);
+	joy_advaxisu = gEngfuncs.pfnRegisterVariable("joyadvaxisu", "0", 0);
+	joy_advaxisv = gEngfuncs.pfnRegisterVariable("joyadvaxisv", "0", 0);
+	joy_forwardthreshold = gEngfuncs.pfnRegisterVariable("joyforwardthreshold", "0.15", 0);
+	joy_sidethreshold = gEngfuncs.pfnRegisterVariable("joysidethreshold", "0.15", 0);
+	joy_pitchthreshold = gEngfuncs.pfnRegisterVariable("joypitchthreshold", "0.15", 0);
+	joy_yawthreshold = gEngfuncs.pfnRegisterVariable("joyyawthreshold", "0.15", 0);
+	joy_forwardsensitivity = gEngfuncs.pfnRegisterVariable("joyforwardsensitivity", "-1.0", 0);
+	joy_sidesensitivity = gEngfuncs.pfnRegisterVariable("joysidesensitivity", "-1.0", 0);
+	joy_pitchsensitivity = gEngfuncs.pfnRegisterVariable("joypitchsensitivity", "1.0", 0);
+	joy_yawsensitivity = gEngfuncs.pfnRegisterVariable("joyyawsensitivity", "-1.0", 0);
+	joy_wwhack1 = gEngfuncs.pfnRegisterVariable("joywwhack1", "0.0", 0);
+	joy_wwhack2 = gEngfuncs.pfnRegisterVariable("joywwhack2", "0.0", 0);
 
-	ac_forwardmove = ac_sidemove = rel_yaw = rel_pitch = 0;
+	gEngfuncs.pfnAddCommand("force_centerview", Force_CenterView_f);
+
+	IN_StartupMouse();
 }

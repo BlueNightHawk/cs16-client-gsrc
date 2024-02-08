@@ -253,10 +253,10 @@ void Localize_Init( void )
 	// always load default language translation
 	Localize_InitLanguage( "english" );
 
-	const char *language = gEngfuncs.pfnGetCvarString( "ui_language" );
+	//const char *language = gEngfuncs.pfnGetCvarString( "ui_language" );
 
-	if( language[0] && strcmp( language, "english" ))
-		Localize_InitLanguage( language );
+	//if( language[0] && strcmp( language, "english" ))
+	//	Localize_InitLanguage( language );
 }
 
 void Localize_Free( void )
